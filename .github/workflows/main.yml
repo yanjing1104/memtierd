@@ -9,7 +9,7 @@ jobs:
     uses: actions/checkout@v3
 
   - name: Build memtierd
-     run: make bin/memtierd
+    run: make bin/memtierd
 
   - name: Run unit test
-     run: make test
+    run: make test
