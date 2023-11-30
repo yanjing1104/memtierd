@@ -4,9 +4,6 @@ on:
   pull_request:
 
 jobs:
-  test:
-    runs-on: debian-sid
-
     steps:
     - name: Checkout
       uses: actions/checkout@v3
