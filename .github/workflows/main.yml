@@ -19,9 +19,6 @@ jobs:
     - name: Install golangci-lint
       run: curl -sfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.51.2
 
-    - name: Gofmt
-      run: make format
-
     - name: Build
       run: make
 
