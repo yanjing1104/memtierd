@@ -363,7 +363,7 @@ func (p *Prompt) cmdSwap(args []string) CommandStatus {
 					return csOk
 				}
 				if pages, err := ar.PagesMatching(0); err == nil {
-					task := NewMoverTask(pages, Node(NODE_SWAP))
+					task := NewMoverTask(pages, Node(NodeSwap))
 					p.mover.AddTask(task)
 				} else {
 					p.output("could not read pages of pid %d: %s", pid, err)
