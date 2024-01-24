@@ -140,7 +140,6 @@ func (t *TrackerSoftDirty) addRanges(pid int) {
 func (t *TrackerSoftDirty) AddPids(pids []int) {
 	log.Debugf("TrackerSoftDirty: AddPids(%v)\n", pids)
 	for _, pid := range pids {
-		t.clearPageBits(pid)
 		t.regionsMutex.Lock()
 		t.addRanges(pid)
 		t.regionsMutex.Unlock()
@@ -215,7 +214,7 @@ func (t *TrackerSoftDirty) Start() error {
 		return fmt.Errorf("sampler already running")
 	}
 	t.toSampler = make(chan byte, 1)
-	t.clearPageBitsForRegionPids()
+	t.clearPageBits()
 	go t.sampler()
 	return nil
 }
@@ -255,88 +254,19 @@ func (t *TrackerSoftDirty) sampler() {
 				lastRegionsUpdateNs = currentNs
 			}
 			t.countPages()
-			t.clearPageBitsForRegionPids()
+			t.clearPageBits()
 		}
 	}
 }
-
-func (t *TrackerSoftDirty) countPages() {
-	pmAttrs := PMPresentSet | PMExclusiveSet
-
-	var kpfFile *ProcKpageflagsFile
-	var err error
-
-	t.mutex.Lock()
-	trackReferenced := t.config.TrackReferenced
-	maxCount := t.config.MaxCountPerRegion
-	if maxCount == 0 {
-		maxCount = t.config.PagesInRegion
-	}
-	skipPageProb := t.config.SkipPageProb
-	pagemapReadahead := t.config.PagemapReadahead
-	t.mutex.Unlock()
-
-	cntPagesAccessed := uint64(0)
-	cntPagesWritten := uint64(0)
+func (t *TrackerSoftDirty) walkRegions(regions map[int]*[]*AddrRanges, pagemapReadahead int, maxCount uint64, pageHandler func(pagemapBits uint64, pageAddr uint64) int) {
 
 	totAccessed := uint64(0)
 	totWritten := uint64(0)
 	totScanned := uint64(0)
-
-	if trackReferenced {
-		// Referenced bits are in /proc/kpageflags.
-		// Open the file already.
-		kpfFile, err = ProcKpageflagsOpen()
-		if err != nil {
-			return
-		}
-		defer kpfFile.Close()
-	}
-
-	// pageHandler is called for all matching pages in the pagemap.
-	// It counts number of pages accessed and written in a region.
-	// The result is stored to cntPagesAccessed and cntPagesWritten.
-	pageHandler := func(pagemapBits uint64, pageAddr uint64) int {
-		totScanned++
-		if pagemapBits&PM_SOFT_DIRTY == PM_SOFT_DIRTY {
-			cntPagesWritten++
-		}
-		if trackReferenced {
-			pfn := pagemapBits & PM_PFN
-			flags, err := kpfFile.ReadFlags(pfn)
-			if err != nil {
-				return -1
-			}
-			if flags&KPF_REFERENCED == KPF_REFERENCED {
-				cntPagesAccessed++
-			}
-		}
-		// If we have exceeded the max count per region on the
-		// counters we are tracking, stop reading pages further.
-		if (cntPagesWritten > maxCount) &&
-			(!trackReferenced || cntPagesAccessed > maxCount) {
-			return -1
-		}
-		if skipPageProb > 0 {
-			// skip pages in sampling read
-			if skipPageProb >= 1000 {
-				return -1
-			}
-			n := 0
-			for rand.Intn(1000) < skipPageProb {
-				n++
-			}
-			return n
-		}
-		return 0
-	}
-	t.regionsMutex.Lock()
-	regions := make(map[int]*[]*AddrRanges, len(t.regions))
-	for pid, allPidAddrRanges := range t.regions {
-		regions[pid] = &allPidAddrRanges
-	}
-	t.regionsMutex.Unlock()
+	cntPagesAccessed := uint64(0)
+	cntPagesWritten := uint64(0)
 	scanStartTime := time.Now().UnixNano()
+	pmAttrs := PMPresentSet | PMExclusiveSet
 	for pid, pAllPidAddrRanges := range regions {
 		totScanned = 0
 		totAccessed = 0
@@ -417,6 +347,82 @@ func (t *TrackerSoftDirty) countPages() {
 	}
 }
 
+func (t *TrackerSoftDirty) countPages() {
+
+	var kpfFile *ProcKpageflagsFile
+	var err error
+
+	t.mutex.Lock()
+	trackReferenced := t.config.TrackReferenced
+	maxCount := t.config.MaxCountPerRegion
+	if maxCount == 0 {
+		maxCount = t.config.PagesInRegion
+	}
+	skipPageProb := t.config.SkipPageProb
+	pagemapReadahead := t.config.PagemapReadahead
+	t.mutex.Unlock()
+
+	cntPagesAccessed := uint64(0)
+	cntPagesWritten := uint64(0)
+
+	totScanned := uint64(0)
+
+	if trackReferenced {
+		// Referenced bits are in /proc/kpageflags.
+		// Open the file already.
+		kpfFile, err = ProcKpageflagsOpen()
+		if err != nil {
+			return
+		}
+		defer kpfFile.Close()
+	}
+
+	// pageHandler is called for all matching pages in the pagemap.
+	// It counts number of pages accessed and written in a region.
+	// The result is stored to cntPagesAccessed and cntPagesWritten.
+	pageHandler := func(pagemapBits uint64, pageAddr uint64) int {
+		totScanned++
+		if pagemapBits&PM_SOFT_DIRTY == PM_SOFT_DIRTY {
+			cntPagesWritten++
+		}
+		if trackReferenced {
+			pfn := pagemapBits & PM_PFN
+			flags, err := kpfFile.ReadFlags(pfn)
+			if err != nil {
+				return -1
+			}
+			if flags&KPF_REFERENCED == KPF_REFERENCED {
+				cntPagesAccessed++
+			}
+		}
+		// If we have exceeded the max count per region on the
+		// counters we are tracking, stop reading pages further.
+		if (cntPagesWritten > maxCount) &&
+			(!trackReferenced || cntPagesAccessed > maxCount) {
+			return -1
+		}
+		if skipPageProb > 0 {
+			// skip pages in sampling read
+			if skipPageProb >= 1000 {
+				return -1
+			}
+			n := 0
+			for rand.Intn(1000) < skipPageProb {
+				n++
+			}
+			return n
+		}
+		return 0
+	}
+	t.regionsMutex.Lock()
+	regions := make(map[int]*[]*AddrRanges, len(t.regions))
+	for pid, allPidAddrRanges := range t.regions {
+		regions[pid] = &allPidAddrRanges
+	}
+	t.regionsMutex.Unlock()
+	t.walkRegions(regions, pagemapReadahead, maxCount, pageHandler)
+}
+
 func (t *TrackerSoftDirty) regionsPids() []int {
 	t.regionsMutex.Lock()
 	defer t.regionsMutex.Unlock()
@@ -427,23 +433,19 @@ func (t *TrackerSoftDirty) regionsPids() []int {
 	return pids
 }
 
-func (t *TrackerSoftDirty) clearPageBits(pid int) {
+func (t *TrackerSoftDirty) clearPageBits() {
 	var err error
-	pidString := strconv.Itoa(pid)
-	path := "/proc/" + pidString + "/clear_refs"
-	err = procWrite(path, []byte("4\n"))
-	if t.config.TrackReferenced && err == nil {
-		err = procWrite(path, []byte("1\n"))
-	}
-	if err != nil {
-		// This process cannot be tracked anymore, remove it.
-		t.removePid(pid)
-	}
-}
-
-func (t *TrackerSoftDirty) clearPageBitsForRegionPids() {
 	for _, pid := range t.regionsPids() {
-		t.clearPageBits(pid)
+		pidString := strconv.Itoa(pid)
+		path := "/proc/" + pidString + "/clear_refs"
+		err = procWrite(path, []byte("4\n"))
+		if t.config.TrackReferenced && err == nil {
+			err = procWrite(path, []byte("1\n"))
+		}
+		if err != nil {
+			// This process cannot be tracked anymore, remove it.
+			t.removePid(pid)
+		}
 	}
 }
 

@@ -338,6 +338,173 @@ func (p *Prompt) cmdArange(args []string) CommandStatus {
 	return csOk
 }
 
+func (p *Prompt) doOptPidCGroup(optPidCgroups *string) (bool, []int) {
+
+	allPids := []int{}
+	pw, err := NewPidWatcherCgroups()
+	if err != nil {
+		p.output("cannot create new pidwatcher cgroups: %s", err)
+		return true, allPids
+	}
+	cgPaths := []string{}
+	for _, cgPathWildcard := range strings.Split(*optPidCgroups, ",") {
+		paths, err := filepath.Glob(cgPathWildcard)
+		if err != nil {
+			p.output("bad wildcard %q", cgPathWildcard)
+			return true, allPids
+		}
+		cgPaths = append(cgPaths, paths...)
+	}
+	if len(cgPaths) == 0 {
+		p.output("could not find any matching cgroups\n")
+		return true, allPids
+	}
+	pwConfigJSON, err := json.Marshal(
+		PidWatcherCgroupsConfig{
+			IntervalMs: 1000,
+			Cgroups:    cgPaths,
+		},
+	)
+	if err != nil {
+		p.output("cannot marshal pidwatcher config: %s", err)
+		return true, allPids
+	}
+	if err := pw.SetConfigJSON(string(pwConfigJSON)); err != nil {
+		p.output("cannot set pidwatcher config %v: %s", pwConfigJSON, err)
+		return true, allPids
+	}
+	pw.SetPidListener(p)
+	p.lastAddPids = []int{}
+	if err := pw.Poll(); err != nil {
+		p.output("cannot poll pidwatcher: %s", err)
+		return true, allPids
+	}
+	if len(p.lastAddPids) == 0 {
+		p.output("could not find any pids from cgroups %v\n", cgPaths)
+		return true, allPids
+	}
+	allPids = append(allPids, p.lastAddPids...)
+	return false, allPids
+
+}
+func (p *Prompt) walkPidStatusVaddrs(pid int, ar *AddrRanges, status, vaddrs *bool) bool {
+	pmFile, err := ProcPagemapOpen(pid)
+	if err != nil {
+		p.output("%s\n", err)
+		return true
+	}
+	defer pmFile.Close()
+
+	pages := 0
+	swapped := 0
+	vaddrStart := uint64(0)
+	vaddrEnd := uint64(0)
+	_ = pmFile.ForEachPage(ar.Ranges(), 0,
+		func(pmBits, pageAddr uint64) int {
+			pages++
+			if (pmBits>>PMB_SWAP)&1 == 0 {
+				if vaddrStart > 0 && *vaddrs {
+					p.output("%s\n", NewAddrRange(vaddrStart, vaddrEnd))
+				}
+				vaddrStart = 0
+				return 0
+			}
+			swapped++
+			vaddrEnd = pageAddr + constUPagesize
+			if vaddrStart == 0 {
+				vaddrStart = pageAddr
+			}
+			return 0
+		})
+	if vaddrStart > 0 && *vaddrs {
+		p.output("%s\n", NewAddrRange(vaddrStart, vaddrEnd))
+	}
+	p.output("%d %d / %d pages, %d / %d MB (%.1f %%) swapped out\n",
+		pid,
+		swapped, pages,
+		int64(swapped)*constPagesize/(1024*1024),
+		int64(pages)*constPagesize/(1024*1024),
+		float32(100*swapped)/float32(pages))
+	return false
+
+}
+func (p *Prompt) walkPidSwapInSwapOut(pid int, ar *AddrRanges, swapIn *bool, swapOut *bool, useMover *bool) bool {
+
+	if *swapIn {
+		memFile, err := ProcMemOpen(ar.Pid())
+		if err != nil {
+			p.output("%s\n", err)
+			return true
+		}
+		defer memFile.Close()
+		for _, r := range ar.Ranges() {
+			if err = memFile.ReadNoData(r.Addr(), r.EndAddr()); err != nil {
+				p.output("%s\n", err)
+				return true
+			}
+		}
+	}
+	if *swapOut {
+		if *useMover {
+			if err := p.mover.Start(); err != nil {
+				p.output("mover error: %v\n", err)
+				return true
+			}
+			if pages, err := ar.PagesMatching(0); err == nil {
+				task := NewMoverTask(pages, NodeSwap)
+				p.mover.AddTask(task)
+			} else {
+				p.output("could not read pages of pid %d: %s", pid, err)
+			}
+		} else {
+			if err := ar.SwapOut(); err != nil {
+				p.output("%s\n", err)
+			}
+		}
+	}
+	return false
+
+}
+func (p *Prompt) walkPid(pid int, ranges *string, swapIn *bool, swapOut *bool, useMover *bool, status, vaddrs *bool) bool {
+
+	process := NewProcess(pid)
+	ar, err := process.AddressRanges()
+	if err != nil {
+		p.output("error reading address ranges of process %d: %v\n", pid, err)
+		return true
+	}
+
+	selectedRanges := []AddrRange{}
+	if *ranges != "" {
+		selectedRanges, err = parseOptRanges(*ranges)
+		if err != nil {
+			p.output("%s", err)
+			return true
+		}
+	}
+	if len(selectedRanges) > 0 {
+		ar.Intersection(selectedRanges)
+		p.output("using %d address ranges\n", len(ar.Ranges()))
+	}
+	if len(ar.Ranges()) == 0 {
+		p.output("no address ranges from which to find pages\n")
+		return true
+	}
+	shouldStop := p.walkPidSwapInSwapOut(pid, ar, swapIn, swapOut, useMover)
+	if shouldStop {
+		return true
+	}
+
+	if *status || *vaddrs {
+		shouldStop = p.walkPidStatusVaddrs(pid, ar, status, vaddrs)
+		if shouldStop {
+			return true
+		}
+	}
+	return false
+
+}
+
 func (p *Prompt) cmdSwap(args []string) CommandStatus {
 	optPid := p.f.Int("pid", -1, "look for pages of PID")
 	optPids := p.f.String("pids", "", "-pids=PID[,PID...] act on all pids")
@@ -354,49 +521,11 @@ func (p *Prompt) cmdSwap(args []string) CommandStatus {
 	}
 	allPids := []int{}
 	if *optPidCgroups != "" {
-		pw, err := NewPidWatcherCgroups()
-		if err != nil {
-			p.output("cannot create new pidwatcher cgroups: %s", err)
+		var isStop bool
+		isStop, allPids = p.doOptPidCGroup(optPidCgroups)
+		if isStop {
 			return csOk
 		}
-		cgPaths := []string{}
-		for _, cgPathWildcard := range strings.Split(*optPidCgroups, ",") {
-			paths, err := filepath.Glob(cgPathWildcard)
-			if err != nil {
-				p.output("bad wildcard %q", cgPathWildcard)
-				return csOk
-			}
-			cgPaths = append(cgPaths, paths...)
-		}
-		if len(cgPaths) == 0 {
-			p.output("could not find any matching cgroups\n")
-			return csOk
-		}
-		pwConfigJSON, err := json.Marshal(
-			PidWatcherCgroupsConfig{
-				IntervalMs: 1000,
-				Cgroups:    cgPaths,
-			},
-		)
-		if err != nil {
-			p.output("cannot marshal pidwatcher config: %s", err)
-			return csOk
-		}
-		if err := pw.SetConfigJSON(string(pwConfigJSON)); err != nil {
-			p.output("cannot set pidwatcher config %v: %s", pwConfigJSON, err)
-			return csOk
-		}
-		pw.SetPidListener(p)
-		p.lastAddPids = []int{}
-		if err := pw.Poll(); err != nil {
-			p.output("cannot poll pidwatcher: %s", err)
-			return csOk
-		}
-		if len(p.lastAddPids) == 0 {
-			p.output("could not find any pids from cgroups %v\n", cgPaths)
-			return csOk
-		}
-		allPids = append(allPids, p.lastAddPids...)
 	}
 	if *optPid != -1 {
 		allPids = append(allPids, *optPid)
@@ -417,169 +546,51 @@ func (p *Prompt) cmdSwap(args []string) CommandStatus {
 		return csOk
 	}
 	for _, pid := range allPids {
-		process := NewProcess(pid)
-		ar, err := process.AddressRanges()
-		if err != nil {
-			p.output("error reading address ranges of process %d: %v\n", pid, err)
+		stop := p.walkPid(pid, ranges, swapIn, swapOut, useMover, status, vaddrs)
+		if stop {
 			return csOk
-		}
-
-		selectedRanges := []AddrRange{}
-		if *ranges != "" {
-			selectedRanges, err = parseOptRanges(*ranges)
-			if err != nil {
-				p.output("%s", err)
-				return csOk
-			}
-		}
-		if len(selectedRanges) > 0 {
-			ar.Intersection(selectedRanges)
-			p.output("using %d address ranges\n", len(ar.Ranges()))
-		}
-		if len(ar.Ranges()) == 0 {
-			p.output("no address ranges from which to find pages\n")
-			return csOk
-		}
-		if *swapIn {
-			memFile, err := ProcMemOpen(ar.Pid())
-			if err != nil {
-				p.output("%s\n", err)
-				return csOk
-			}
-			defer memFile.Close()
-			for _, r := range ar.Ranges() {
-				if err = memFile.ReadNoData(r.Addr(), r.EndAddr()); err != nil {
-					p.output("%s\n", err)
-					return csOk
-				}
-			}
-		}
-		if *swapOut {
-			if *useMover {
-				if err := p.mover.Start(); err != nil {
-					p.output("mover error: %v\n", err)
-					return csOk
-				}
-				if pages, err := ar.PagesMatching(0); err == nil {
-					task := NewMoverTask(pages, NodeSwap)
-					p.mover.AddTask(task)
-				} else {
-					p.output("could not read pages of pid %d: %s", pid, err)
-				}
-			} else {
-				if err := ar.SwapOut(); err != nil {
-					p.output("%s\n", err)
-				}
-			}
-		}
-
-		if *status || *vaddrs {
-			pmFile, err := ProcPagemapOpen(pid)
-			if err != nil {
-				p.output("%s\n", err)
-				return csOk
-			}
-			defer pmFile.Close()
-
-			pages := 0
-			swapped := 0
-			vaddrStart := uint64(0)
-			vaddrEnd := uint64(0)
-			_ = pmFile.ForEachPage(ar.Ranges(), 0,
-				func(pmBits, pageAddr uint64) int {
-					pages++
-					if (pmBits>>PMB_SWAP)&1 == 0 {
-						if vaddrStart > 0 && *vaddrs {
-							p.output("%s\n", NewAddrRange(vaddrStart, vaddrEnd))
-						}
-						vaddrStart = 0
-						return 0
-					}
-					swapped++
-					vaddrEnd = pageAddr + constUPagesize
-					if vaddrStart == 0 {
-						vaddrStart = pageAddr
-					}
-					return 0
-				})
-			if vaddrStart > 0 && *vaddrs {
-				p.output("%s\n", NewAddrRange(vaddrStart, vaddrEnd))
-			}
-			p.output("%d %d / %d pages, %d / %d MB (%.1f %%) swapped out\n",
-				pid,
-				swapped, pages,
-				int64(swapped)*constPagesize/(1024*1024),
-				int64(pages)*constPagesize/(1024*1024),
-				float32(100*swapped)/float32(pages))
 		}
 	}
 	return csOk
 }
 
-func (p *Prompt) cmdPages(args []string) CommandStatus {
-	pid := p.f.Int("pid", -1, "look for pages of PID")
-	attrs := p.f.String("attrs", "", "include only <Exclusive,Dirty,NotDirty,InHeap,InAnonymous> pages")
-	ranges := p.f.String("ranges", "", "-ranges=RANGE[,RANGE...]. RANGE syntax: STARTADDR (single page at STARTADDR), STARTADDR-ENDADDR, STARTADDR+SIZE[kMG].")
-	fromNode := p.f.Int("node", -1, "include only pages currently on NODE")
-	pr := p.f.Int("pr", -1, "-pr=NUM: print first NUM address ranges")
-	pm := p.f.Int("pm", -1, "-pm=NUM: print pagemap bits and PFNs of first NUM pages in selected ranges")
-	pk := p.f.Int("pk", -1, "-pk=PFN: print kpageflags of a page")
-	pi := p.f.Int("pi", -1, "-pi=PFN: print idle bit from /sys/kernel/mm/page_idle/bitmap")
-	si := p.f.Int("si", -1, "-si=PFN: set idle bit of a page")
+func (p *Prompt) doSiAndPi(si, pi *int) CommandStatus {
+	bmFile, err := ProcPageIdleBitmapOpen()
+	if err != nil {
+		p.output("failed to open idle bitmap: %s\n", err)
+		return csOk
+	}
+	defer bmFile.Close()
+	if *pi > -1 {
+		isIdle, err := bmFile.GetIdle(uint64(*pi))
+		if err != nil {
+			p.output("failed to read idle bit: %s\n", err)
+			return csOk
+		}
+		p.output("PFN %d idle: %v\n", *pi, isIdle)
+	}
+	if *si > -1 {
+		err := bmFile.SetIdle(uint64(*si))
+		if err != nil {
+			p.output("failed to set idle bit: %s\n", err)
+			return csOk
+		}
+	}
+	return csOk
 
-	if err := p.f.Parse(args); err != nil {
+}
+func (p *Prompt) cmdPagesPkOption(pid *int, pk *int) CommandStatus {
+	kpFile, err := ProcKpageflagsOpen()
+	if err != nil {
+		p.output("opening kpageflags failed: %s\n", err)
 		return csOk
 	}
-	// if launched without arguments, report current status of selected pages
-	if len(args) == 0 {
-		if p.pages == nil {
-			p.output("no pages selelected, try pages -pid PID\n")
-			return csOk
-		}
-		nodePageCount := p.pages.NodePageCount()
-		p.output("pages of pid %d\n", p.pages.Pid())
-		for _, node := range sortedNodeKeys(nodePageCount) {
-			p.output("node %d: %d\n", node, nodePageCount[node])
-		}
+	flags, err := kpFile.ReadFlags(uint64(*pk))
+	if err != nil {
+		p.output("reading flags of PFN %d from kpageflags failed: %s\n", *pk, err)
 		return csOk
 	}
-	if *pi > -1 || *si > -1 {
-		bmFile, err := ProcPageIdleBitmapOpen()
-		if err != nil {
-			p.output("failed to open idle bitmap: %s\n", err)
-			return csOk
-		}
-		defer bmFile.Close()
-		if *pi > -1 {
-			isIdle, err := bmFile.GetIdle(uint64(*pi))
-			if err != nil {
-				p.output("failed to read idle bit: %s\n", err)
-				return csOk
-			}
-			p.output("PFN %d idle: %v\n", *pi, isIdle)
-		}
-		if *si > -1 {
-			err := bmFile.SetIdle(uint64(*si))
-			if err != nil {
-				p.output("failed to set idle bit: %s\n", err)
-				return csOk
-			}
-		}
-		return csOk
-	}
-
-	if *pk > -1 {
-		kpFile, err := ProcKpageflagsOpen()
-		if err != nil {
-			p.output("opening kpageflags failed: %s\n", err)
-			return csOk
-		}
-		flags, err := kpFile.ReadFlags(uint64(*pk))
-		if err != nil {
-			p.output("reading flags of PFN %d from kpageflags failed: %s\n", *pk, err)
-			return csOk
-		}
-		p.output(`LOCKED        %d
+	p.output(`LOCKED        %d
 ERROR         %d
 REFERENCED    %d
 UPTODATE      %d
@@ -607,39 +618,143 @@ ZERO_PAGE     %d
 IDLE          %d
 PGTABLE       %d
 `,
-			(flags>>KPFB_LOCKED)&1,
-			(flags>>KPFB_ERROR)&1,
-			(flags>>KPFB_REFERENCED)&1,
-			(flags>>KPFB_UPTODATE)&1,
-			(flags>>KPFB_DIRTY)&1,
-			(flags>>KPFB_LRU)&1,
-			(flags>>KPFB_ACTIVE)&1,
-			(flags>>KPFB_SLAB)&1,
-			(flags>>KPFB_WRITEBACK)&1,
-			(flags>>KPFB_RECLAIM)&1,
-			(flags>>KPFB_BUDDY)&1,
-			(flags>>KPFB_MMAP)&1,
-			(flags>>KPFB_ANON)&1,
-			(flags>>KPFB_SWAPCACHE)&1,
-			(flags>>KPFB_SWAPBACKED)&1,
-			(flags>>KPFB_COMPOUND_HEAD)&1,
-			(flags>>KPFB_COMPOUND_TAIL)&1,
-			(flags>>KPFB_HUGE)&1,
-			(flags>>KPFB_UNEVICTABLE)&1,
-			(flags>>KPFB_HWPOISON)&1,
-			(flags>>KPFB_NOPAGE)&1,
-			(flags>>KPFB_KSM)&1,
-			(flags>>KPFB_THP)&1,
-			(flags>>KPFB_OFFLINE)&1,
-			(flags>>KPFB_ZERO_PAGE)&1,
-			(flags>>KPFB_IDLE)&1,
-			(flags>>KPFB_PGTABLE)&1)
+		(flags>>KPFB_LOCKED)&1,
+		(flags>>KPFB_ERROR)&1,
+		(flags>>KPFB_REFERENCED)&1,
+		(flags>>KPFB_UPTODATE)&1,
+		(flags>>KPFB_DIRTY)&1,
+		(flags>>KPFB_LRU)&1,
+		(flags>>KPFB_ACTIVE)&1,
+		(flags>>KPFB_SLAB)&1,
+		(flags>>KPFB_WRITEBACK)&1,
+		(flags>>KPFB_RECLAIM)&1,
+		(flags>>KPFB_BUDDY)&1,
+		(flags>>KPFB_MMAP)&1,
+		(flags>>KPFB_ANON)&1,
+		(flags>>KPFB_SWAPCACHE)&1,
+		(flags>>KPFB_SWAPBACKED)&1,
+		(flags>>KPFB_COMPOUND_HEAD)&1,
+		(flags>>KPFB_COMPOUND_TAIL)&1,
+		(flags>>KPFB_HUGE)&1,
+		(flags>>KPFB_UNEVICTABLE)&1,
+		(flags>>KPFB_HWPOISON)&1,
+		(flags>>KPFB_NOPAGE)&1,
+		(flags>>KPFB_KSM)&1,
+		(flags>>KPFB_THP)&1,
+		(flags>>KPFB_OFFLINE)&1,
+		(flags>>KPFB_ZERO_PAGE)&1,
+		(flags>>KPFB_IDLE)&1,
+		(flags>>KPFB_PGTABLE)&1)
 
+	return csOk
+}
+func (p *Prompt) cmdPagesPmOption(pid *int, ar *AddrRanges, pm *int) CommandStatus {
+	pmFile, err := ProcPagemapOpen(*pid)
+	if err != nil {
+		p.output("%s", err)
 		return csOk
+	}
+	defer pmFile.Close()
+	printed := 0
+	p.output("bits: softdirty, exclusive, uffd_wp, file, swap, present\n")
+	_ = pmFile.ForEachPage(ar.Ranges(), 0,
+		func(pmBits, pageAddr uint64) int {
+			p.output("%x: bits: %d%d%d%d%d%d pfn: %d\n",
+				pageAddr,
+				(pmBits>>PMB_SOFT_DIRTY)&1,
+				(pmBits>>PMB_MMAP_EXCLUSIVE)&1,
+				(pmBits>>PMB_UFFD_WP)&1,
+				(pmBits>>PMB_FILE)&1,
+				(pmBits>>PMB_SWAP)&1,
+				(pmBits>>PMB_PRESENT)&1,
+				pmBits&PM_PFN)
+			printed++
+			if printed >= *pm {
+				return -1
+			}
+			return 0
+		})
+	return csOk
+
+}
+
+func (p *Prompt) cmdPagesRangeOption(ranges *string, ar *AddrRanges) bool {
+	selectedRanges := []AddrRange{}
+	var err error
+	if *ranges != "" {
+		selectedRanges, err = parseOptRanges(*ranges)
+		if err != nil {
+			p.output("%s", err)
+			return true
+		}
+	}
+	if len(selectedRanges) > 0 {
+		ar.Intersection(selectedRanges)
+		p.output("using %d address ranges\n", len(ar.Ranges()))
+	}
+	if len(ar.Ranges()) == 0 {
+		p.output("no address ranges from which to find pages\n")
+		return true
+	}
+	return false
+
+}
+func (p *Prompt) cmdPagesPiSiPkPid(pi, pk, si, pid *int) (bool, CommandStatus) {
+	if *pi > -1 || *si > -1 {
+		return true, p.doSiAndPi(si, pi)
+	}
+
+	if *pk > -1 {
+		return true, p.cmdPagesPkOption(pid, pk)
 	}
 	// there are arguments, select new set of pages
 	if *pid <= 0 {
 		p.output("missing -pid=PID\n")
+		return true, csOk
+	}
+	return false, csOk
+
+}
+func (p *Prompt) cmdPagesCheckArgs(args []string) bool {
+
+	// if launched without arguments, report current status of selected pages
+	if len(args) == 0 {
+		if p.pages == nil {
+			p.output("no pages selelected, try pages -pid PID\n")
+			return true
+		}
+		nodePageCount := p.pages.NodePageCount()
+		p.output("pages of pid %d\n", p.pages.Pid())
+		for _, node := range sortedNodeKeys(nodePageCount) {
+			p.output("node %d: %d\n", node, nodePageCount[node])
+		}
+		return true
+	}
+	return false
+}
+
+func (p *Prompt) cmdPages(args []string) CommandStatus {
+	pid := p.f.Int("pid", -1, "look for pages of PID")
+	attrs := p.f.String("attrs", "", "include only <Exclusive,Dirty,NotDirty,InHeap,InAnonymous> pages")
+	ranges := p.f.String("ranges", "", "-ranges=RANGE[,RANGE...]. RANGE syntax: STARTADDR (single page at STARTADDR), STARTADDR-ENDADDR, STARTADDR+SIZE[kMG].")
+	fromNode := p.f.Int("node", -1, "include only pages currently on NODE")
+	pr := p.f.Int("pr", -1, "-pr=NUM: print first NUM address ranges")
+	pm := p.f.Int("pm", -1, "-pm=NUM: print pagemap bits and PFNs of first NUM pages in selected ranges")
+	pk := p.f.Int("pk", -1, "-pk=PFN: print kpageflags of a page")
+	pi := p.f.Int("pi", -1, "-pi=PFN: print idle bit from /sys/kernel/mm/page_idle/bitmap")
+	si := p.f.Int("si", -1, "-si=PFN: set idle bit of a page")
+
+	if err := p.f.Parse(args); err != nil {
+		return csOk
+	}
+
+	shouldStop := p.cmdPagesCheckArgs(args)
+	if shouldStop {
+		return csOk
+	}
+
+	shouldStop, csOk := p.cmdPagesPiSiPkPid(pi, pk, si, pid)
+	if shouldStop {
 		return csOk
 	}
 	p.output("searching for address ranges of pid %d\n", *pid)
@@ -654,49 +769,12 @@ PGTABLE       %d
 		return csOk
 	}
 	p.output("found %d address ranges\n", len(ar.Ranges()))
-	selectedRanges := []AddrRange{}
-	if *ranges != "" {
-		selectedRanges, err = parseOptRanges(*ranges)
-		if err != nil {
-			p.output("%s", err)
-			return csOk
-		}
-	}
-	if len(selectedRanges) > 0 {
-		ar.Intersection(selectedRanges)
-		p.output("using %d address ranges\n", len(ar.Ranges()))
-	}
-	if len(ar.Ranges()) == 0 {
-		p.output("no address ranges from which to find pages\n")
+	shouldStop = p.cmdPagesRangeOption(ranges, ar)
+	if shouldStop {
 		return csOk
 	}
 	if *pm != -1 {
-		pmFile, err := ProcPagemapOpen(*pid)
-		if err != nil {
-			p.output("%s", err)
-			return csOk
-		}
-		defer pmFile.Close()
-		printed := 0
-		p.output("bits: softdirty, exclusive, uffd_wp, file, swap, present\n")
-		_ = pmFile.ForEachPage(ar.Ranges(), 0,
-			func(pmBits, pageAddr uint64) int {
-				p.output("%x: bits: %d%d%d%d%d%d pfn: %d\n",
-					pageAddr,
-					(pmBits>>PMB_SOFT_DIRTY)&1,
-					(pmBits>>PMB_MMAP_EXCLUSIVE)&1,
-					(pmBits>>PMB_UFFD_WP)&1,
-					(pmBits>>PMB_FILE)&1,
-					(pmBits>>PMB_SWAP)&1,
-					(pmBits>>PMB_PRESENT)&1,
-					pmBits&PM_PFN)
-				printed++
-				if printed >= *pm {
-					return -1
-				}
-				return 0
-			})
-		return csOk
+		return p.cmdPagesPmOption(pid, ar, pm)
 	}
 	p.aranges = ar
 	p.output("aranges = <%d address ranges of pid %d>\n", len(ar.Ranges()), ar.Pid())
@@ -726,10 +804,24 @@ PGTABLE       %d
 	return csOk
 }
 
-func (p *Prompt) cmdMover(args []string) CommandStatus {
-	config := p.f.String("config", "", "reconfigure mover with JSON string")
-	configDump := p.f.Bool("config-dump", false, "dump current configuration")
-	pagesTo := p.f.Int("pages-to", -1, "move pages to NODE int")
+func (p *Prompt) cmdMoverPageTo(pagesTo int) bool {
+	err := p.mover.Start()
+	if err != nil {
+		p.output("mover error: %v\n", err)
+		return true
+	}
+	if p.pages == nil {
+		p.output("mover error: set pages before moving\n")
+		return true
+	}
+	toNode := Node(pagesTo)
+	task := NewMoverTask(p.pages, toNode)
+	p.mover.AddTask(task)
+	return false
+
+}
+
+func (p *Prompt) cmdMoverOption(args []string) CommandStatus {
 	start := p.f.Bool("start", false, "start mover")
 	stop := p.f.Bool("stop", false, "stop mover")
 	pause := p.f.Bool("pause", false, "pause moving")
@@ -739,28 +831,6 @@ func (p *Prompt) cmdMover(args []string) CommandStatus {
 	wait := p.f.Bool("wait", false, "wait until all tasks have completed")
 	if err := p.f.Parse(args); err != nil {
 		return csOk
-	}
-	if *config != "" {
-		if err := p.mover.SetConfigJSON(*config); err != nil {
-			p.output("mover reconfiguration error: %v\n", err)
-		}
-	}
-	if *configDump {
-		p.output("%s\n", p.mover.GetConfigJSON())
-	}
-	if *pagesTo >= 0 {
-		err := p.mover.Start()
-		if err != nil {
-			p.output("mover error: %v\n", err)
-			return csOk
-		}
-		if p.pages == nil {
-			p.output("mover error: set pages before moving\n")
-			return csOk
-		}
-		toNode := Node(*pagesTo)
-		task := NewMoverTask(p.pages, toNode)
-		p.mover.AddTask(task)
 	}
 	if *stop {
 		p.mover.Stop()
@@ -790,6 +860,29 @@ func (p *Prompt) cmdMover(args []string) CommandStatus {
 		p.output("mover wait received: %s\n", <-p.mover.Wait(thsPaused, thsAllDone))
 	}
 	return csOk
+}
+func (p *Prompt) cmdMover(args []string) CommandStatus {
+	config := p.f.String("config", "", "reconfigure mover with JSON string")
+	configDump := p.f.Bool("config-dump", false, "dump current configuration")
+	pagesTo := p.f.Int("pages-to", -1, "move pages to NODE int")
+	if err := p.f.Parse(args); err != nil {
+		return csOk
+	}
+	if *config != "" {
+		if err := p.mover.SetConfigJSON(*config); err != nil {
+			p.output("mover reconfiguration error: %v\n", err)
+		}
+	}
+	if *configDump {
+		p.output("%s\n", p.mover.GetConfigJSON())
+	}
+	if *pagesTo >= 0 {
+		stop := p.cmdMoverPageTo(*pagesTo)
+		if stop {
+			return csOk
+		}
+	}
+	return p.cmdMoverOption(args)
 }
 
 func (p *Prompt) cmdStats(args []string) CommandStatus {
@@ -824,31 +917,20 @@ func (p *Prompt) cmdStats(args []string) CommandStatus {
 	}
 	return csOk
 }
-
-func (p *Prompt) cmdPidWatcher(args []string) CommandStatus {
+func (p *Prompt) cmdPidWatcherOption(args []string) bool {
 	ls := p.f.Bool("ls", false, "list available pidwatchers")
 	create := p.f.String("create", "", "create new pidwatcher NAME")
 	config := p.f.String("config", "", "configure the pidwatcher with JSON string")
 	configDump := p.f.Bool("config-dump", false, "dump current pidwatcher configuration")
-	start := p.f.Bool("start", false, "start the pidwatcher")
-	stop := p.f.Bool("stop", false, "stop the pidwatcher")
-	poll := p.f.Bool("poll", false, "poll the pidwatcher")
-	listener := p.f.String("listener", "", "use a listener: 'tracker' or 'log'")
-	dump := p.f.Bool("dump", false, "dump pidwatcher internals")
-
-	if err := p.f.Parse(args); err != nil {
-		return csOk
-	}
-	remainder := p.f.Args()
 	if *ls {
 		p.output(strings.Join(PidWatcherList(), "\n") + "\n")
-		return csOk
+		return true
 	}
 	if *create != "" {
 		pidwatcher, err := NewPidWatcher(*create)
 		if err != nil {
 			p.output("creating pidwatcher failed: %v\n", err)
-			return csOk
+			return true
 		}
 		p.pidwatcher = pidwatcher
 		p.output("pidwatcher created\n")
@@ -857,7 +939,7 @@ func (p *Prompt) cmdPidWatcher(args []string) CommandStatus {
 	// Next actions will require existing pidwatcher
 	if p.pidwatcher == nil {
 		p.output("no pidwatcher, create one with -create NAME [-config CONFIG]\n")
-		return csOk
+		return true
 	}
 	if *config != "" {
 		if err := p.pidwatcher.SetConfigJSON(*config); err != nil {
@@ -868,6 +950,24 @@ func (p *Prompt) cmdPidWatcher(args []string) CommandStatus {
 	}
 	if *configDump {
 		p.output("%s\n", p.pidwatcher.GetConfigJSON())
+	}
+	return false
+
+}
+func (p *Prompt) cmdPidWatcher(args []string) CommandStatus {
+	start := p.f.Bool("start", false, "start the pidwatcher")
+	stop := p.f.Bool("stop", false, "stop the pidwatcher")
+	poll := p.f.Bool("poll", false, "poll the pidwatcher")
+	listener := p.f.String("listener", "", "use a listener: 'tracker' or 'log'")
+	dump := p.f.Bool("dump", false, "dump pidwatcher internals")
+
+	if err := p.f.Parse(args); err != nil {
+		return csOk
+	}
+	remainder := p.f.Args()
+	shouldStop := p.cmdPidWatcherOption(args)
+	if shouldStop {
+		return csOk
 	}
 	if *listener != "" {
 		switch *listener {
@@ -910,32 +1010,24 @@ func (p *Prompt) RemovePids(pids []int) {
 	p.output("pidwatcher: RemovePids(%v)\n", pids)
 }
 
-func (p *Prompt) cmdTracker(args []string) CommandStatus {
+func (p *Prompt) cmdTrackerOption(args []string) bool {
 	ls := p.f.Bool("ls", false, "list available memory trackers")
 	create := p.f.String("create", "", "create new tracker NAME")
 	config := p.f.String("config", "", "configure tracker with JSON string")
-	configDump := p.f.Bool("config-dump", false, "dump current configuration")
-	configFile := p.f.String("config-file", "", "reconfigure tracker with JSON FILE")
 	start := p.f.String("start", "", "start tracking PID[,PID...]")
-	reset := p.f.Bool("reset", false, "reset page access counters")
 	stop := p.f.Bool("stop", false, "stop tracker")
-	counters := p.f.Bool("counters", false, "print tracker raw counters")
-	heat := p.f.Bool("heat", false, "print address range heats")
-	dump := p.f.Bool("dump", false, "dump tracker internals")
-
 	if err := p.f.Parse(args); err != nil {
-		return csOk
+		return true
 	}
-	remainder := p.f.Args()
 	if *ls {
 		p.output(strings.Join(TrackerList(), "\n") + "\n")
-		return csOk
+		return true
 	}
 	if *create != "" {
 		tracker, err := NewTracker(*create)
 		if err != nil {
 			p.output("creating tracker failed: %v\n", err)
-			return csOk
+			return true
 		}
 		p.tracker = tracker
 		p.output("tracker created\n")
@@ -943,19 +1035,7 @@ func (p *Prompt) cmdTracker(args []string) CommandStatus {
 	// Next actions will require existing tracker
 	if p.tracker == nil {
 		p.output("no tracker, create one with -create NAME [-config CONFIG]\n")
-		return csOk
-	}
-	if *configFile != "" {
-		configJSON, err := os.ReadFile(*configFile)
-		if err != nil {
-			p.output("reading file %q failed: %s", *configFile, err)
-			return csOk
-		}
-		err = p.tracker.SetConfigJSON(string(configJSON))
-		if err != nil {
-			p.output("config failed: %s\n", err)
-			return csOk
-		}
+		return true
 	}
 	if *config != "" {
 		if err := p.tracker.SetConfigJSON(*config); err != nil {
@@ -975,14 +1055,32 @@ func (p *Prompt) cmdTracker(args []string) CommandStatus {
 				p.tracker.AddPids([]int{pid})
 			} else {
 				p.output("invalid pid: %q\n", pidStr)
-				return csOk
+				return true
 			}
 		}
 		if err := p.tracker.Start(); err != nil {
 			p.output("start failed: %v\n", err)
-			return csOk
+			return true
 		}
 		p.output("tracker started\n")
+	}
+	return false
+}
+
+func (p *Prompt) cmdTracker(args []string) CommandStatus {
+	reset := p.f.Bool("reset", false, "reset page access counters")
+	configDump := p.f.Bool("config-dump", false, "dump current configuration")
+	counters := p.f.Bool("counters", false, "print tracker raw counters")
+	heat := p.f.Bool("heat", false, "print address range heats")
+	dump := p.f.Bool("dump", false, "dump tracker internals")
+
+	if err := p.f.Parse(args); err != nil {
+		return csOk
+	}
+	remainder := p.f.Args()
+	shouldStop := p.cmdTrackerOption(args)
+	if shouldStop {
+		return csOk
 	}
 	if *configDump {
 		p.output("%s\n", p.tracker.GetConfigJSON())
@@ -1016,13 +1114,55 @@ func (p *Prompt) cmdTracker(args []string) CommandStatus {
 	}
 	return csOk
 }
-
-func (p *Prompt) cmdPolicy(args []string) CommandStatus {
+func (p *Prompt) cmdPolicyOption(args []string) bool {
 	ls := p.f.Bool("ls", false, "list available policies")
 	create := p.f.String("create", "", "create new policy NAME")
 	config := p.f.String("config", "", "reconfigure policy with JSON string")
-	configDump := p.f.Bool("config-dump", false, "dump current config")
 	configFile := p.f.String("config-file", "", "reconfigure policy with JSON FILE")
+	if err := p.f.Parse(args); err != nil {
+		return true
+	}
+	if *ls {
+		p.output(strings.Join(PolicyList(), "\n") + "\n")
+		return true
+	}
+	if *create != "" {
+		policy, err := NewPolicy(*create)
+		if err != nil {
+			p.output("%s", err)
+			return true
+		}
+		p.policy = policy
+		p.output("policy created\n")
+	}
+	if p.policy == nil {
+		p.output("no policy, create one with -create NAME\n")
+		return true
+	}
+	if *configFile != "" {
+		configJSON, err := os.ReadFile(*configFile)
+		if err != nil {
+			p.output("reading file %q failed: %s", *configFile, err)
+			return true
+		}
+		err = p.policy.SetConfigJSON(string(configJSON))
+		if err != nil {
+			p.output("config failed: %s\n", err)
+			return true
+		}
+	}
+	if *config != "" {
+		err := p.policy.SetConfigJSON(*config)
+		if err != nil {
+			p.output("config failed: %s\n", err)
+			return true
+		}
+	}
+	return false
+
+}
+func (p *Prompt) cmdPolicy(args []string) CommandStatus {
+	configDump := p.f.Bool("config-dump", false, "dump current config")
 	dump := p.f.Bool("dump", false, "dump policy state")
 	start := p.f.Bool("start", false, "start policy")
 	stop := p.f.Bool("stop", false, "stop policy")
@@ -1030,41 +1170,9 @@ func (p *Prompt) cmdPolicy(args []string) CommandStatus {
 		return csOk
 	}
 	remainder := p.f.Args()
-	if *ls {
-		p.output(strings.Join(PolicyList(), "\n") + "\n")
+	shouldStop := p.cmdPolicyOption(args)
+	if shouldStop {
 		return csOk
-	}
-	if *create != "" {
-		policy, err := NewPolicy(*create)
-		if err != nil {
-			p.output("%s", err)
-			return csOk
-		}
-		p.policy = policy
-		p.output("policy created\n")
-	}
-	if p.policy == nil {
-		p.output("no policy, create one with -create NAME\n")
-		return csOk
-	}
-	if *configFile != "" {
-		configJSON, err := os.ReadFile(*configFile)
-		if err != nil {
-			p.output("reading file %q failed: %s", *configFile, err)
-			return csOk
-		}
-		err = p.policy.SetConfigJSON(string(configJSON))
-		if err != nil {
-			p.output("config failed: %s\n", err)
-			return csOk
-		}
-	}
-	if *config != "" {
-		err := p.policy.SetConfigJSON(*config)
-		if err != nil {
-			p.output("config failed: %s\n", err)
-			return csOk
-		}
 	}
 	p.SetPolicy(p.policy)
 	if *start {
@@ -1087,30 +1195,20 @@ func (p *Prompt) cmdPolicy(args []string) CommandStatus {
 	}
 	return csOk
 }
-
-func (p *Prompt) cmdRoutines(args []string) CommandStatus {
+func (p *Prompt) cmdRoutinesOption(args []string) bool {
 	ls := p.f.Bool("ls", false, "list available routine types")
 	create := p.f.String("create", "", "create new routine from type NAME")
-	config := p.f.String("config", "", "reconfigure the routine with JSON string")
-	configDump := p.f.Bool("config-dump", false, "dump current config")
-	configFile := p.f.String("config-file", "", "reconfigure the routine with JSON FILE")
-	dump := p.f.Bool("dump", false, "dump routine state")
-	start := p.f.Bool("start", false, "start routine")
-	stop := p.f.Bool("stop", false, "stop routine")
 	use := p.f.Int("use", -1, "pass commands to routine at given index (0, 1, ...)")
-	if err := p.f.Parse(args); err != nil {
-		return csOk
-	}
-	remainder := p.f.Args()
+	configFile := p.f.String("config-file", "", "reconfigure the routine with JSON FILE")
 	if *ls {
 		p.output(strings.Join(RoutineList(), "\n") + "\n")
-		return csOk
+		return true
 	}
 	if *create != "" {
 		routine, err := NewRoutine(*create)
 		if err != nil {
 			p.output("%s\n", err)
-			return csOk
+			return true
 		}
 		p.routines = append(p.routines, routine)
 		p.routineInUse = len(p.routines) - 1
@@ -1118,12 +1216,12 @@ func (p *Prompt) cmdRoutines(args []string) CommandStatus {
 	}
 	if len(p.routines) == 0 {
 		p.output("no routines, create one with -create NAME\n")
-		return csOk
+		return true
 	}
 	if *use > -1 {
 		if *use >= len(p.routines) {
 			p.output("invalid routine %d, the last one is %d\n", *use, len(p.routines)-1)
-			return csOk
+			return true
 		}
 		p.routineInUse = *use
 	}
@@ -1131,13 +1229,29 @@ func (p *Prompt) cmdRoutines(args []string) CommandStatus {
 		configJSON, err := os.ReadFile(*configFile)
 		if err != nil {
 			p.output("reading file %q failed: %s\n", *configFile, err)
-			return csOk
+			return true
 		}
 		err = p.routines[p.routineInUse].SetConfigJSON(string(configJSON))
 		if err != nil {
 			p.output("config failed: %s\n", err)
-			return csOk
+			return true
 		}
+	}
+	return false
+}
+
+func (p *Prompt) cmdRoutines(args []string) CommandStatus {
+	config := p.f.String("config", "", "reconfigure the routine with JSON string")
+	configDump := p.f.Bool("config-dump", false, "dump current config")
+	dump := p.f.Bool("dump", false, "dump routine state")
+	start := p.f.Bool("start", false, "start routine")
+	stop := p.f.Bool("stop", false, "stop routine")
+	if err := p.f.Parse(args); err != nil {
+		return csOk
+	}
+	remainder := p.f.Args()
+	if shouldStop := p.cmdRoutinesOption(args); shouldStop {
+		return csOk
 	}
 	if *config != "" {
 		err := p.routines[p.routineInUse].SetConfigJSON(*config)

@@ -192,6 +192,26 @@ func (p *PolicyAge) Tracker() Tracker {
 	return p.tracker
 }
 
+func (p *PolicyAge) dealTimeAndPid(args []string, timeDurations []time.Duration, pids []int) (string, []time.Duration, []int) {
+	for _, timeSpec := range strings.Split(strings.TrimSpace(args[1]), ",") {
+		timeDur, err := parseTimeDuration(timeSpec)
+		if err != nil {
+			return fmt.Sprintf("invalid TIMESPEC %q: %s", timeSpec, err), timeDurations, pids
+		}
+		timeDurations = append(timeDurations, timeDur)
+	}
+	if len(args) == 3 {
+		for _, pidSpec := range strings.Split(strings.TrimSpace(args[2]), ",") {
+			pid, err := strconv.Atoi(pidSpec)
+			if err != nil {
+				return fmt.Sprintf("invalid pid: %q", pidSpec), timeDurations, pids
+			}
+			pids = append(pids, pid)
+		}
+	}
+	return "", timeDurations, pids
+}
+
 // Dump generates a string representation of the policy based on specified arguments.
 func (p *PolicyAge) Dump(args []string) string {
 	dumpHelp := `dump accessed TIMESPEC,TIMESPEC[,TIMESPEC]... [PID[,PID]]
@@ -216,21 +236,10 @@ func (p *PolicyAge) Dump(args []string) string {
 				time.Duration(p.config.SwapOutMs)*time.Millisecond,
 				time.Duration(0))
 		} else {
-			for _, timeSpec := range strings.Split(strings.TrimSpace(args[1]), ",") {
-				timeDur, err := parseTimeDuration(timeSpec)
-				if err != nil {
-					return fmt.Sprintf("invalid TIMESPEC %q: %s", timeSpec, err)
-				}
-				timeDurations = append(timeDurations, timeDur)
-			}
-			if len(args) == 3 {
-				for _, pidSpec := range strings.Split(strings.TrimSpace(args[2]), ",") {
-					pid, err := strconv.Atoi(pidSpec)
-					if err != nil {
-						return fmt.Sprintf("invalid pid: %q", pidSpec)
-					}
-					pids = append(pids, pid)
-				}
+			var errInfo string
+			errInfo, timeDurations, pids = p.dealTimeAndPid(args, timeDurations, pids)
+			if errInfo != "" {
+				return errInfo
 			}
 		}
 		if len(timeDurations) < 2 {

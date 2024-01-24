@@ -373,6 +373,41 @@ func (debugfs *damonDebugfs) KdamondPids() []int {
 	return []int{kpid}
 }
 
+func (sysfs *damonSysfs) dealKdamondsList(config *TrackerDamonConfig) error {
+	for _, kdamondID := range config.KdamondsList {
+		if kdamondID >= sysfs.nrKdamonds {
+			return fmt.Errorf("illegal kdamond %d in DAMON tracker configuration KdamondsList: last available kdamond in system is %d", kdamondID, sysfs.nrKdamonds-1)
+		}
+		contextsPath := fmt.Sprintf("%s/%d/contexts", trackerDamonSysfsPath, kdamondID)
+		nrContextsPath := fmt.Sprintf("%s/%d/contexts/nr_contexts", trackerDamonSysfsPath, kdamondID)
+		targetsPath := fmt.Sprintf("%s/%d/contexts/0/targets", trackerDamonSysfsPath, kdamondID)
+		statePath := fmt.Sprintf("%s/%d/state", trackerDamonSysfsPath, kdamondID)
+		pidPath := fmt.Sprintf("%s/%d/pid", trackerDamonSysfsPath, kdamondID)
+		attrsPath := fmt.Sprintf("%s/%d/contexts/0/monitoring_attrs", trackerDamonSysfsPath, kdamondID)
+		if currState, err := procReadTrimmed(statePath); currState != "off" && err == nil {
+			log.Warnf("taking control over kdamond %d despite %q was %q", kdamondID, statePath, currState)
+			if err = procWrite(statePath, []byte("off")); err != nil {
+				return fmt.Errorf("failed to switch off %q", statePath)
+
+			}
+		}
+		if err := procWriteInt(nrContextsPath, 1); err != nil {
+			return fmt.Errorf("kdamond context creation failed: error when writing 1 to %q: %w", nrContextsPath, err)
+		}
+		if err := procWrite(contextsPath+"/0/operations", []byte("vaddr")); err != nil {
+			return fmt.Errorf("kdamond context operation \"vaddr\" failed: %w", err)
+		}
+		sysfs.kdamonds = append(sysfs.kdamonds, &kdamondInfo{
+			id:          kdamondID,
+			targetsPath: targetsPath,
+			statePath:   statePath,
+			pidPath:     pidPath,
+			attrsPath:   attrsPath,
+		})
+		sysfs.kdamondsList = append(sysfs.kdamondsList, kdamondID)
+	}
+	return nil
+}
 func (sysfs *damonSysfs) initialize(config *TrackerDamonConfig) error {
 	if sysfs.nrKdamonds != 0 {
 		return fmt.Errorf("damonSysfs interface already initialized: %+v", sysfs)
@@ -414,36 +449,10 @@ func (sysfs *damonSysfs) initialize(config *TrackerDamonConfig) error {
 	sysfs.nrKdamonds = globalNrKdamonds
 	if len(config.KdamondsList) > 0 {
 		// Take control over all kdamonds that have been listed for this damon tracker
-		for _, kdamondID := range config.KdamondsList {
-			if kdamondID >= sysfs.nrKdamonds {
-				return fmt.Errorf("illegal kdamond %d in DAMON tracker configuration KdamondsList: last available kdamond in system is %d", kdamondID, sysfs.nrKdamonds-1)
-			}
-			contextsPath := fmt.Sprintf("%s/%d/contexts", trackerDamonSysfsPath, kdamondID)
-			nrContextsPath := fmt.Sprintf("%s/%d/contexts/nr_contexts", trackerDamonSysfsPath, kdamondID)
-			targetsPath := fmt.Sprintf("%s/%d/contexts/0/targets", trackerDamonSysfsPath, kdamondID)
-			statePath := fmt.Sprintf("%s/%d/state", trackerDamonSysfsPath, kdamondID)
-			pidPath := fmt.Sprintf("%s/%d/pid", trackerDamonSysfsPath, kdamondID)
-			attrsPath := fmt.Sprintf("%s/%d/contexts/0/monitoring_attrs", trackerDamonSysfsPath, kdamondID)
-			if currState, err := procReadTrimmed(statePath); currState != "off" && err == nil {
-				log.Warnf("taking control over kdamond %d despite %q was %q", kdamondID, statePath, currState)
-				if err = procWrite(statePath, []byte("off")); err != nil {
-					return fmt.Errorf("failed to switch off %q", statePath)
-				}
-			}
-			if err = procWriteInt(nrContextsPath, 1); err != nil {
-				return fmt.Errorf("kdamond context creation failed: error when writing 1 to %q: %w", nrContextsPath, err)
-			}
-			if err = procWrite(contextsPath+"/0/operations", []byte("vaddr")); err != nil {
-				return fmt.Errorf("kdamond context operation \"vaddr\" failed: %w", err)
-			}
-			sysfs.kdamonds = append(sysfs.kdamonds, &kdamondInfo{
-				id:          kdamondID,
-				targetsPath: targetsPath,
-				statePath:   statePath,
-				pidPath:     pidPath,
-				attrsPath:   attrsPath,
-			})
-			sysfs.kdamondsList = append(sysfs.kdamondsList, kdamondID)
+		err = sysfs.dealKdamondsList(config)
+		if err != nil {
+			return err
+
 		}
 	} else {
 		return fmt.Errorf("missing DAMON configuration kdamondslist")

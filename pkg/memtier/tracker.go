@@ -202,6 +202,27 @@ func flattenDefaultUnion(tc0, tc1 TrackerCounter) TrackerCounter {
 	}
 }
 
+func (tcs *TrackerCounters) complexCondition(flatTcs TrackerCounters, tcPid int, tcStartAddr uint64) bool {
+
+	if len(flatTcs) == 0 ||
+		flatTcs[len(flatTcs)-1].AR.Pid() != tcPid ||
+		flatTcs[len(flatTcs)-1].AR.Ranges()[0].EndAddr() <= tcStartAddr {
+		return true
+	}
+	return false
+}
+
+func (tcs *TrackerCounters) initiates(cut func(tc0 TrackerCounter, ar *AddrRange) TrackerCounter, union func(tc0, tc1 TrackerCounter) TrackerCounter) (func(tc0 TrackerCounter, ar *AddrRange) TrackerCounter, func(tc0, tc1 TrackerCounter) TrackerCounter) {
+	if cut == nil {
+		cut = flattenDefaultCut
+	}
+	if union == nil {
+		union = flattenDefaultUnion
+	}
+	return cut, union
+
+}
+
 // Flattened returns tracker counters with overlapping parts squashed.
 // Parameters:
 //
@@ -213,21 +234,14 @@ func (tcs *TrackerCounters) Flattened(cut func(tc0 TrackerCounter, ar *AddrRange
 	// - flatTcs is sorted by pid, then by start address, then by end address
 	// - flatTcs has no overlapping addresses.
 	// - the last end address in flatTcs is the end addr of the last item.
-	if cut == nil {
-		cut = flattenDefaultCut
-	}
-	if union == nil {
-		union = flattenDefaultUnion
-	}
+	cut, union = tcs.initiates(cut, union)
 	flatTcs := TrackerCounters{}
 	for _, tc := range *tcs {
 		tcStartAddr := tc.AR.Ranges()[0].Addr()
 		tcEndAddr := tc.AR.Ranges()[0].EndAddr()
 		tcPid := tc.AR.Pid()
 
-		if len(flatTcs) == 0 ||
-			flatTcs[len(flatTcs)-1].AR.Pid() != tcPid ||
-			flatTcs[len(flatTcs)-1].AR.Ranges()[0].EndAddr() <= tcStartAddr {
+		if tcs.complexCondition(flatTcs, tcPid, tcStartAddr) {
 			flatTcs = append(flatTcs, tc)
 			continue
 		}

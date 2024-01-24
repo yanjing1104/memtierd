@@ -19,35 +19,7 @@ import (
 	"time"
 )
 
-func TestUpdateCountersBoundaryCheck(t *testing.T) {
-	hm := NewCounterHeatmap()
-
-	PS := constUPagesize
-	tcs0 := TrackerCounters{
-		// Memory regions have a hole.
-		// [100..150][150..200][200..250]<hole>[500..600]
-		TrackerCounter{
-			AR: NewAddrRanges(2000,
-				AddrRange{100 * PS, 50},
-				AddrRange{150 * PS, 50}),
-		},
-		TrackerCounter{
-			Accesses: 1,
-			AR: NewAddrRanges(2000,
-				AddrRange{200 * PS, 50}),
-		},
-		TrackerCounter{
-			Writes: 100,
-			AR: NewAddrRanges(2000,
-				AddrRange{500 * PS, 100}),
-		},
-	}
-	timestamp := int64(0)
-	hm.UpdateFromCounters(&tcs0, timestamp)
-
-	t.Logf(hm.Dump())
-
-	// Boundary value check: nil/non-nil
+func assertBoundaryValue(t *testing.T, hm *Heatmap, PS uint64) {
 	if hm.HeatRangeAt(4040, 0) != nil {
 		t.Errorf("nil expected when requesting heat for non-existing pid")
 	}
@@ -84,6 +56,39 @@ func TestUpdateCountersBoundaryCheck(t *testing.T) {
 	if hm.HeatRangeAt(2000, 600*PS) != nil {
 		t.Errorf("nil expected when requesting heat after the last range")
 	}
+
+}
+
+func TestUpdateCountersBoundaryCheck(t *testing.T) {
+	hm := NewCounterHeatmap()
+
+	PS := constUPagesize
+	tcs0 := TrackerCounters{
+		// Memory regions have a hole.
+		// [100..150][150..200][200..250]<hole>[500..600]
+		TrackerCounter{
+			AR: NewAddrRanges(2000,
+				AddrRange{100 * PS, 50},
+				AddrRange{150 * PS, 50}),
+		},
+		TrackerCounter{
+			Accesses: 1,
+			AR: NewAddrRanges(2000,
+				AddrRange{200 * PS, 50}),
+		},
+		TrackerCounter{
+			Writes: 100,
+			AR: NewAddrRanges(2000,
+				AddrRange{500 * PS, 100}),
+		},
+	}
+	timestamp := int64(0)
+	hm.UpdateFromCounters(&tcs0, timestamp)
+
+	t.Logf(hm.Dump())
+
+	// Boundary value check: nil/non-nil
+	assertBoundaryValue(t, hm, PS)
 
 	// heat on each region after first non-overlapping counters
 	hr0 := hm.HeatRangeAt(2000, 100*PS)

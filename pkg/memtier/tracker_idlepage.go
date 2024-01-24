@@ -249,73 +249,10 @@ func (t *TrackerIdlePage) sampler() {
 	}
 }
 
-func (t *TrackerIdlePage) countPages() {
-	t.mutex.Lock()
-	defer t.mutex.Unlock()
-
-	maxCount := t.config.MaxCountPerRegion
-	if maxCount == 0 {
-		maxCount = t.config.PagesInRegion
-	}
-	cntPagesAccessed := uint64(0)
-
+func (t *TrackerIdlePage) walkRegions(pageHandler func(pagemapBits uint64, pageAddr uint64) int, maxCount uint64) {
 	totAccessed := uint64(0)
 	totScanned := uint64(0)
-
-	kpfFile, err := ProcKpageflagsOpen()
-	if err != nil {
-		return
-	}
-	defer kpfFile.Close()
-	if t.config.KpageflagsReadahead > 0 {
-		kpfFile.SetReadahead(t.config.KpageflagsReadahead)
-	}
-	if t.config.KpageflagsReadahead == -1 {
-		kpfFile.SetReadahead(0)
-	}
-
-	bmFile, err := ProcPageIdleBitmapOpen()
-	if err != nil {
-		return
-	}
-	defer bmFile.Close()
-	if t.config.BitmapReadahead > 0 {
-		bmFile.SetReadahead(t.config.BitmapReadahead)
-	}
-	if t.config.BitmapReadahead == -1 {
-		bmFile.SetReadahead(0)
-	}
-
-	// pageHandler is called for all matching pages in the pagemap.
-	// It counts number of pages accessed and written in a region.
-	// The result is stored to cntPagesAccessed and cntPagesWritten.
-	pageHandler := func(pagemapBits uint64, pageAddr uint64) int {
-		totScanned++
-		pfn := pagemapBits & PM_PFN
-		pageIdle, err := bmFile.GetIdle(pfn)
-		if err != nil {
-			return -1
-		}
-		if !pageIdle {
-			flags, err := kpfFile.ReadFlags(pfn)
-			if err != nil {
-				return -1
-			}
-			if ((flags>>KPFB_COMPOUND_HEAD)&1 == 0 &&
-				(flags>>KPFB_COMPOUND_TAIL)&1 == 0) ||
-				((flags>>KPFB_COMPOUND_HEAD)&1 == 1) {
-				// Compound tail pages never get idle bit,
-				// so read accesses only from idle bits of
-				// normal pages and heads of compound pages.
-				cntPagesAccessed++
-			}
-		}
-		if cntPagesAccessed >= maxCount {
-			return -1
-		}
-		return 0
-	}
-
+	cntPagesAccessed := uint64(0)
 	scanStartTime := time.Now().UnixNano()
 	for pid, allPidAddrRanges := range t.regions {
 		totScanned = 0
@@ -385,6 +322,74 @@ func (t *TrackerIdlePage) countPages() {
 		})
 		scanStartTime = scanEndTime
 	}
+
+}
+func (t *TrackerIdlePage) countPages() {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	maxCount := t.config.MaxCountPerRegion
+	if maxCount == 0 {
+		maxCount = t.config.PagesInRegion
+	}
+	cntPagesAccessed := uint64(0)
+	totScanned := uint64(0)
+
+	kpfFile, err := ProcKpageflagsOpen()
+	if err != nil {
+		return
+	}
+	defer kpfFile.Close()
+	if t.config.KpageflagsReadahead > 0 {
+		kpfFile.SetReadahead(t.config.KpageflagsReadahead)
+	}
+	if t.config.KpageflagsReadahead == -1 {
+		kpfFile.SetReadahead(0)
+	}
+
+	bmFile, err := ProcPageIdleBitmapOpen()
+	if err != nil {
+		return
+	}
+	defer bmFile.Close()
+	if t.config.BitmapReadahead > 0 {
+		bmFile.SetReadahead(t.config.BitmapReadahead)
+	}
+	if t.config.BitmapReadahead == -1 {
+		bmFile.SetReadahead(0)
+	}
+
+	// pageHandler is called for all matching pages in the pagemap.
+	// It counts number of pages accessed and written in a region.
+	// The result is stored to cntPagesAccessed and cntPagesWritten.
+	pageHandler := func(pagemapBits uint64, pageAddr uint64) int {
+		totScanned++
+		pfn := pagemapBits & PM_PFN
+		pageIdle, err := bmFile.GetIdle(pfn)
+		if err != nil {
+			return -1
+		}
+		if !pageIdle {
+			flags, err := kpfFile.ReadFlags(pfn)
+			if err != nil {
+				return -1
+			}
+			if ((flags>>KPFB_COMPOUND_HEAD)&1 == 0 &&
+				(flags>>KPFB_COMPOUND_TAIL)&1 == 0) ||
+				((flags>>KPFB_COMPOUND_HEAD)&1 == 1) {
+				// Compound tail pages never get idle bit,
+				// so read accesses only from idle bits of
+				// normal pages and heads of compound pages.
+				cntPagesAccessed++
+			}
+		}
+		if cntPagesAccessed >= maxCount {
+			return -1
+		}
+		return 0
+	}
+
+	t.walkRegions(pageHandler, maxCount)
 }
 
 func (t *TrackerIdlePage) setIdleBits() {
